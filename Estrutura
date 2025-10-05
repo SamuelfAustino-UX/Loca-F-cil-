@@ -1,0 +1,901 @@
+repo-root/
+├─ backend/
+│     └─ Dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+ENV NODE_ENV=production
+EXPOSE 3000
+CMD ["node", "server.js"]
+
+│  ├─ package.json
+{
+  "name": "loca-facil-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "worker": "node workers/billingWorker.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "body-parser": "^1.20.2",
+    "bullmq": "^2.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.0",
+    "node-cron": "^3.0.2",
+    "pg": "^8.11.0",
+    "stripe": "^12.15.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+
+│  ├─ Dockerfile
+│  ├─ server.js
+import express from 'express';
+import bodyParser from 'body-parser';
+import cors from 'cors';
+import dotenv from 'dotenv';
+dotenv.config();
+
+import { pool } from './utils/db.js';
+
+// rotas
+import authRoutes from './routes/auth.js';
+import propertiesRoutes from './routes/properties.js';
+import contractsRoutes from './routes/contracts.js';
+import paymentsRoutes from './routes/payments.js';
+import webhooksRoutes from './routes/webhooks.js';
+
+const app = express();
+
+// webhook precisa do raw body — montaremos antes do json parser
+app.use('/webhooks/stripe', webhooksRoutes);
+
+// depois o parser JSON normal
+app.use(cors());
+app.use(bodyParser.json());
+
+// APIs principais
+app.use('/auth', authRoutes);
+app.use('/properties', propertiesRoutes);
+app.use('/contracts', contractsRoutes);
+app.use('/payments', paymentsRoutes);
+
+app.get('/', (req, res) => res.json({ ok: true, now: new Date() }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
+│  ├─ .env.example
+# PostgreSQL
+DATABASE_URL=postgres://locafacil:locafacilpass@postgres:5432/locafacil
+
+# App
+PORT=3000
+JWT_SECRET=troque_por_uma_senha_forte
+
+# Stripe
+STRIPE_KEY=sk_test_xxx
+STRIPE_PUBLISHABLE_KEY=pk_test_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+
+# Redis
+REDIS_URL=redis://redis:6379
+
+# Plataforma Stripe (opcional)
+STRIPE_PLATFORM_ACCOUNT_ID=acct_xxx
+PLATFORM_FEE_PERCENT=3.0
+
+NODE_ENV=development
+
+│  ├─ db/
+│  │  └─ init.sql
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  phone TEXT,
+  role TEXT NOT NULL CHECK (role IN ('owner','tenant','admin')),
+  password_hash TEXT NOT NULL,
+  stripe_customer_id TEXT,
+  stripe_account_id TEXT, -- connected account id (owner)
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE properties (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT,
+  address TEXT,
+  description TEXT,
+  rent_amount NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE contracts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  property_id UUID REFERENCES properties(id) ON DELETE CASCADE,
+  owner_id UUID REFERENCES users(id),
+  tenant_id UUID REFERENCES users(id),
+  start_date DATE,
+  end_date DATE,
+  monthly_amount NUMERIC(12,2),
+  interest_percent NUMERIC(6,4) DEFAULT 0, -- percent per day (e.g. 0.00033)
+  late_fee_percent NUMERIC(6,4) DEFAULT 0, -- e.g. 2.0
+  status TEXT CHECK (status IN ('draft','active','terminated')) DEFAULT 'draft',
+  stripe_payment_method_id TEXT,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE payments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  contract_id UUID REFERENCES contracts(id),
+  amount NUMERIC(12,2) NOT NULL,
+  status TEXT CHECK (status IN ('pending','paid','failed')) DEFAULT 'pending',
+  due_date DATE,
+  paid_at TIMESTAMP,
+  stripe_charge_id TEXT,
+  attempts INT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE fees_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  payment_id UUID REFERENCES payments(id),
+  label TEXT,
+  amount NUMERIC(12,2),
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE transfers_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  payment_id UUID REFERENCES payments(id),
+  owner_id UUID REFERENCES users(id),
+  stripe_transfer_id TEXT,
+  amount NUMERIC(12,2),
+  created_at TIMESTAMP DEFAULT now()
+);
+
+│  ├─ routes/
+│  │  ├─ auth.js
+import express from 'express';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import { pool } from '../utils/db.js';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const router = express.Router();
+
+router.post('/register', async (req, res) => {
+  try {
+    const { name, email, password, phone, role } = req.body;
+    if (!name || !email || !password || !role) return res.status(400).json({ error: 'missing fields' });
+    const hash = await bcrypt.hash(password, 10);
+    const q = await pool.query(
+      'INSERT INTO users (name,email,phone,role,password_hash) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role',
+      [name, email, phone || null, role, hash]
+    );
+    const user = q.rows[0];
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ user, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const q = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+    if (!q.rows.length) return res.status(403).json({ error: 'invalid' });
+    const user = q.rows[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(403).json({ error: 'invalid' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role }, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+export default router;
+
+│  │  ├─ properties.js
+import express from 'express';
+import { pool } from '../utils/db.js';
+import { authMiddleware } from '../utils/authMiddleware.js';
+
+const router = express.Router();
+
+router.post('/', authMiddleware('owner'), async (req, res) => {
+  try {
+    const { title, address, description, rent_amount } = req.body;
+    const q = await pool.query(
+      'INSERT INTO properties (owner_id,title,address,description,rent_amount) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [req.user.id, title, address, description, rent_amount]
+    );
+    res.json({ property: q.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+router.get('/', async (req, res) => {
+  try {
+    const q = await pool.query('SELECT p.*, u.name as owner_name FROM properties p JOIN users u ON p.owner_id = u.id ORDER BY p.created_at DESC');
+    res.json({ properties: q.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+export default router;
+
+│  │  ├─ contracts.js
+import express from 'express';
+import Stripe from 'stripe';
+import { pool } from '../utils/db.js';
+import { authMiddleware } from '../utils/authMiddleware.js';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const stripe = new Stripe(process.env.STRIPE_KEY, { apiVersion: '2024-11-08' });
+const router = express.Router();
+
+// criar contrato (owner)
+router.post('/', authMiddleware('owner'), async (req, res) => {
+  const { property_id, tenant_id, start_date, end_date, monthly_amount, interest_percent, late_fee_percent } = req.body;
+  try {
+    const q = await pool.query(
+      `INSERT INTO contracts (property_id, owner_id, tenant_id, start_date, end_date, monthly_amount, interest_percent, late_fee_percent, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active') RETURNING *`,
+      [property_id, req.user.id, tenant_id, start_date, end_date, monthly_amount, interest_percent || 0, late_fee_percent || 0]
+    );
+    res.json({ contract: q.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+// cria SetupIntent e retorna client_secret
+router.post('/create-setup-intent', authMiddleware(), async (req, res) => {
+  try {
+    const { contract_id } = req.body;
+    const cQ = await pool.query('SELECT * FROM contracts WHERE id=$1', [contract_id]);
+    if (!cQ.rows.length) return res.status(404).json({ error: 'contract not found' });
+    const contract = cQ.rows[0];
+    const tenantQ = await pool.query('SELECT * FROM users WHERE id=$1', [contract.tenant_id]);
+    if (!tenantQ.rows.length) return res.status(404).json({ error: 'tenant not found' });
+    const tenant = tenantQ.rows[0];
+
+    let stripeCustomerId = tenant.stripe_customer_id;
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({ email: tenant.email, name: tenant.name });
+      stripeCustomerId = customer.id;
+      await pool.query('UPDATE users SET stripe_customer_id=$1 WHERE id=$2', [stripeCustomerId, tenant.id]);
+    }
+
+    const si = await stripe.setupIntents.create({ customer: stripeCustomerId, payment_method_types: ['card'] });
+    res.json({ client_secret: si.client_secret, setup_intent_id: si.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// attach payment method via payment_method_id OR setup_intent_id
+router.post('/:id/attach-payment-method', authMiddleware(), async (req, res) => {
+  try {
+    const { payment_method_id, setup_intent_id } = req.body;
+    const contractId = req.params.id;
+    const cQ = await pool.query('SELECT * FROM contracts WHERE id=$1', [contractId]);
+    if (!cQ.rows.length) return res.status(404).json({ error: 'contract not found' });
+    const contract = cQ.rows[0];
+    const tenantQ = await pool.query('SELECT * FROM users WHERE id=$1', [contract.tenant_id]);
+    const tenant = tenantQ.rows[0];
+    if (!tenant.stripe_customer_id) return res.status(400).json({ error: 'customer missing' });
+
+    let pmId = payment_method_id;
+    if (!pmId && setup_intent_id) {
+      const si = await stripe.setupIntents.retrieve(setup_intent_id);
+      pmId = si.payment_method;
+    }
+    if (!pmId) return res.status(400).json({ error: 'no payment method id' });
+
+    await stripe.paymentMethods.attach(pmId, { customer: tenant.stripe_customer_id });
+    await pool.query('UPDATE contracts SET stripe_payment_method_id=$1 WHERE id=$2', [pmId, contractId]);
+    res.json({ ok: true, payment_method_id: pmId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Onboarding Stripe Connect para owner — cria account e retorna link onboarding
+router.post('/:id/create-owner-onboarding', authMiddleware('owner'), async (req, res) => {
+  try {
+    const ownerId = req.user.id;
+    const ownerQ = await pool.query('SELECT * FROM users WHERE id=$1', [ownerId]);
+    const owner = ownerQ.rows[0];
+    if (!owner) return res.status(404).json({ error: 'owner not found' });
+
+    // create express account
+    const acct = await stripe.accounts.create({
+      type: 'express',
+      country: 'BR',
+      email: owner.email,
+      business_type: 'individual'
+    });
+
+    const accountLink = await stripe.accountLinks.create({
+      account: acct.id,
+      refresh_url: process.env.REFRESH_URL || 'https://yourdomain.com/stripe/refresh',
+      return_url: process.env.RETURN_URL || 'https://yourdomain.com/stripe/return',
+      type: 'account_onboarding'
+    });
+
+    // salvar account.id
+    await pool.query('UPDATE users SET stripe_account_id=$1 WHERE id=$2', [acct.id, ownerId]);
+    res.json({ url: accountLink.url, account_id: acct.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+export default router;
+
+│  │  ├─ payments.js
+import express from 'express';
+import { pool } from '../utils/db.js';
+import { authMiddleware } from '../utils/authMiddleware.js';
+import { enqueueCharge } from '../workers/billingWorkerHelper.js'; // helper que vamos criar
+const router = express.Router();
+
+router.post('/create', authMiddleware(), async (req, res) => {
+  try {
+    const { contract_id, amount, due_date } = req.body;
+    const q = await pool.query('INSERT INTO payments (contract_id, amount, due_date, status) VALUES ($1,$2,$3,$4) RETURNING *', [contract_id, amount, due_date, 'pending']);
+    res.json({ payment: q.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+// enfileira cobrança para o worker processar com retries
+router.post('/:id/enqueue-charge', authMiddleware(), async (req, res) => {
+  try {
+    const paymentId = req.params.id;
+    await enqueueCharge(paymentId);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Forçar cobrança agora (sincrono)
+router.post('/:id/charge', authMiddleware(), async (req, res) => {
+  try {
+    const paymentId = req.params.id;
+    // Enfileira e retorna
+    await enqueueCharge(paymentId);
+    res.json({ ok: true, note: 'charge enqueued' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/contract/:contractId', authMiddleware(), async (req, res) => {
+  try {
+    const q = await pool.query('SELECT * FROM payments WHERE contract_id=$1 ORDER BY due_date DESC', [req.params.contractId]);
+    res.json({ payments: q.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+export default router;
+
+│  │  └─ webhooks.js
+import express from 'express';
+import Stripe from 'stripe';
+import rawBodyParser from 'body-parser';
+import { pool } from '../utils/db.js';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const stripe = new Stripe(process.env.STRIPE_KEY, { apiVersion: '2024-11-08' });
+const router = express.Router();
+
+// raw body parser used only for this route
+router.post('/', rawBodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    console.log('Webhook received:', event.type);
+
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        const pi = event.data.object;
+        const paymentId = pi.metadata?.payment_id;
+        if (paymentId) {
+          await pool.query('UPDATE payments SET status=$1, paid_at=now(), stripe_charge_id=$2 WHERE id=$3', ['paid', pi.id, paymentId]);
+          // aqui você pode enfileirar transfer ao owner
+        }
+        break;
+      }
+      case 'payment_intent.payment_failed': {
+        const pi = event.data.object;
+        const paymentId = pi.metadata?.payment_id;
+        if (paymentId) {
+          await pool.query('UPDATE payments SET status=$1, attempts = attempts + 1 WHERE id=$2', ['failed', paymentId]);
+          // notify / schedule retry
+        }
+        break;
+      }
+      case 'charge.refunded': {
+        // log de reembolso
+        break;
+      }
+      case 'account.updated': {
+        // connected account changed
+        break;
+      }
+      default:
+        console.log('Unhandled event', event.type);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+});
+
+export default router;
+
+│  ├─ utils/
+│  │  ├─ authMiddleware.js
+import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
+dotenv.config();
+
+export function authMiddleware(requiredRole = null) {
+  return (req, res, next) => {
+    const header = req.headers.authorization;
+    if (!header) return res.status(401).json({ error: 'missing token' });
+    const token = header.split(' ')[1];
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = payload; // { id, role, ... }
+      if (requiredRole && payload.role !== requiredRole && payload.role !== 'admin') {
+        return res.status(403).json({ error: 'forbidden' });
+      }
+      next();
+    } catch (err) {
+      return res.status(401).json({ error: 'invalid token' });
+    }
+  };
+}
+
+│  │  └─ db.js
+import pg from 'pg';
+import dotenv from 'dotenv';
+dotenv.config();
+const { Pool } = pg;
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+│  ├─ workers/
+│  │  └─ billingWorkerHelper.js
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
+const billingQueue = new Queue('billing', { connection });
+
+export async function enqueueCharge(paymentId) {
+  // attempts: 3, exponential backoff (60s)
+  await billingQueue.add('charge', { paymentId }, {
+    attempts: 4,
+    backoff: { type: 'exponential', delay: 60 * 1000 },
+    removeOnComplete: true,
+    removeOnFail: false
+  });
+}
+
+│  │  └─ billingWorker.js
+import 'dotenv/config';
+import { Worker, QueueScheduler } from 'bullmq';
+import IORedis from 'ioredis';
+import Stripe from 'stripe';
+import { Pool } from 'pg';
+
+const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
+const stripe = new Stripe(process.env.STRIPE_KEY, { apiVersion: '2024-11-08' });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+new QueueScheduler('billing', { connection });
+
+const worker = new Worker('billing', async job => {
+  const { paymentId } = job.data;
+  console.log('Processing payment job', paymentId);
+  const pQ = await pool.query(
+    `SELECT payments.*, contracts.stripe_payment_method_id, contracts.stripe_customer_id, contracts.owner_id, contracts.monthly_amount, contracts.late_fee_percent, contracts.interest_percent, users.stripe_account_id as owner_stripe_account
+     FROM payments
+     JOIN contracts ON payments.contract_id = contracts.id
+     LEFT JOIN users ON contracts.owner_id = users.id
+     WHERE payments.id=$1`, [paymentId]
+  );
+  if (!pQ.rows.length) throw new Error('payment not found');
+  const p = pQ.rows[0];
+
+  // compute potential late fees
+  let amount = parseFloat(p.amount);
+  if (p.due_date) {
+    const due = new Date(p.due_date);
+    const now = new Date();
+    if (now > due) {
+      const daysLate = Math.floor((now - due)/(1000*60*60*24));
+      const multa = parseFloat(p.late_fee_percent || 0) / 100.0;
+      const juros = parseFloat(p.interest_percent || 0) / 100.0;
+      const multaVal = Math.round((amount * multa) * 100) / 100;
+      const jurosVal = Math.round((amount * juros * daysLate) * 100) / 100;
+      amount += (multaVal + jurosVal);
+      if (multaVal > 0) await pool.query('INSERT INTO fees_log (payment_id,label,amount) VALUES ($1,$2,$3)', [p.id, 'multa', multaVal]);
+      if (jurosVal > 0) await pool.query('INSERT INTO fees_log (payment_id,label,amount) VALUES ($1,$2,$3)', [p.id, 'juros', jurosVal]);
+    }
+  }
+
+  if (!p.stripe_customer_id || !p.stripe_payment_method_id) {
+    await pool.query('UPDATE payments SET status=$1 WHERE id=$2', ['failed', p.id]);
+    throw new Error('missing stripe customer or payment method');
+  }
+
+  try {
+    const pi = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: 'brl',
+      customer: p.stripe_customer_id,
+      payment_method: p.stripe_payment_method_id,
+      off_session: true,
+      confirm: true,
+      metadata: { payment_id: p.id }
+    });
+
+    await pool.query('UPDATE payments SET status=$1, paid_at=now(), stripe_charge_id=$2 WHERE id=$3', ['paid', pi.id, p.id]);
+
+    // compute platform fee and transfer to owner (if connected)
+    const platformFeePercent = parseFloat(process.env.PLATFORM_FEE_PERCENT || '3.0'); // default 3%
+    const platformFee = Math.round(amount * (platformFeePercent/100) * 100) / 100;
+    const ownerAmount = Math.round((amount - platformFee) * 100) / 100;
+
+    if (p.owner_stripe_account) {
+      // create a transfer to connected account (requires platform balance)
+      // Simplified: create transfer
+      const transfer = await stripe.transfers.create({
+        amount: Math.round(ownerAmount * 100),
+        currency: 'brl',
+        destination: p.owner_stripe_account,
+        metadata: { payment_id: p.id }
+      });
+      await pool.query('INSERT INTO transfers_log (payment_id, owner_id, stripe_transfer_id, amount) VALUES ($1,$2,$3,$4)', [p.id, p.owner_id, transfer.id, ownerAmount]);
+    } else {
+      // if owner not connected, keep in platform balance (or mark for manual payout)
+      // store record in transfers_log with null transfer id
+      await pool.query('INSERT INTO transfers_log (payment_id, owner_id, stripe_transfer_id, amount) VALUES ($1,$2,$3,$4)', [p.id, p.owner_id, null, ownerAmount]);
+    }
+
+    return { ok: true };
+  } catch (err) {
+    console.error('Charge failed', err.message || err);
+    await pool.query('UPDATE payments SET attempts = attempts + 1 WHERE id=$1', [p.id]);
+    await pool.query('UPDATE payments SET status=$1 WHERE id=$2', ['failed', p.id]);
+    throw err;
+  }
+}, { connection, concurrency: 4 });
+
+worker.on('failed', (job, err) => {
+  console.error('Job failed', job.id, err.message);
+});
+
+console.log('Billing worker running');
+
+│  └─ scripts/
+│     └─ setup_local.sh
+#!/usr/bin/env bash
+set -e
+echo "Criando DB e rodando init.sql..."
+psql $DATABASE_URL -f db/init.sql
+echo "OK"
+
+├─ docker-compose.yml
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: locafacil
+      POSTGRES_PASSWORD: locafacilpass
+      POSTGRES_DB: locafacil
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://locafacil:locafacilpass@postgres:5432/locafacil
+      PORT: 3000
+      JWT_SECRET: change_this_secret
+      STRIPE_KEY: sk_test_xxx
+      STRIPE_PUBLISHABLE_KEY: pk_test_xxx
+      STRIPE_WEBHOOK_SECRET: whsec_xxx
+      REDIS_URL: redis://redis:6379
+      PLATFORM_FEE_PERCENT: 3.0
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: node workers/billingWorker.js
+    environment:
+      DATABASE_URL: postgres://locafacil:locafacilpass@postgres:5432/locafacil
+      STRIPE_KEY: sk_test_xxx
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  pgdata:
+
+├─ mobile/
+│  ├─ package.json
+{
+  "name": "loca-facil-mobile",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "eas:build": "eas build --platform all"
+  },
+  "dependencies": {
+    "expo": "~50.0.0",
+    "react": "18.2.0",
+    "react-native": "0.73.6",
+    "@react-navigation/native": "^6.1.6",
+    "@react-navigation/native-stack": "^6.9.12",
+    "react-native-webview": "^12.3.0",
+    "@stripe/stripe-react-native": "^0.37.0"
+  }
+}
+
+│  ├─ App.js
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import LoginScreen from './screens/LoginScreen';
+import PaymentSetup from './screens/PaymentSetup';
+import PaymentSetupWebView from './screens/PaymentSetupWebView';
+
+const Stack = createNativeStackNavigator();
+export default function App() {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator initialRouteName="Login">
+        <Stack.Screen name="Login" component={LoginScreen} />
+        <Stack.Screen name="PaymentSetup" component={PaymentSetup} />
+        <Stack.Screen name="PaymentSetupWebView" component={PaymentSetupWebView} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+
+│  ├─ app.json
+{
+  "expo": {
+    "name": "LocaFácil",
+    "slug": "loca-facil",
+    "version": "1.0.0",
+    "platforms": ["ios","android"],
+    "extra": {
+      "apiUrl": "http://localhost:3000"
+    }
+  }
+}
+
+│  ├─ eas.json
+{
+  "build": {
+    "production": {
+      "android": {
+        "workflow": "managed"
+      },
+      "ios": {
+        "workflow": "managed"
+      }
+    }
+  }
+}
+
+│  └─ screens/
+│     ├─ LoginScreen.js
+import React from 'react';
+import { View, Button, Text } from 'react-native';
+
+export default function LoginScreen({ navigation }) {
+  return (
+    <View style={{flex:1,justifyContent:'center',alignItems:'center'}}>
+      <Text>LocaFácil (demo)</Text>
+      <Button title="Salvar Cartão (nativo)" onPress={() => navigation.navigate('PaymentSetup')} />
+      <Button title="Salvar Cartão (webview)" onPress={() => navigation.navigate('PaymentSetupWebView')} />
+    </View>
+  );
+}
+
+│     └─ PaymentSetup.js
+import React, { useState } from 'react';
+import { View, Button, Text, TextInput } from 'react-native';
+import { CardField, useConfirmSetupIntent, StripeProvider } from '@stripe/stripe-react-native';
+import Constants from 'expo-constants';
+
+export default function PaymentSetup({ navigation }) {
+  const [contractId, setContractId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
+  const [message, setMessage] = useState('');
+  const { confirmSetupIntent } = useConfirmSetupIntent();
+
+  const API = Constants.manifest.extra.apiUrl || 'http://localhost:3000';
+
+  async function createSetupIntent() {
+    try {
+      const res = await fetch(`${API}/contracts/create-setup-intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${global.userToken || ''}` },
+        body: JSON.stringify({ contract_id: contractId })
+      });
+      const j = await res.json();
+      if (!res.ok) return setMessage(JSON.stringify(j));
+      setClientSecret(j.client_secret);
+      setMessage('Client secret obtido. Preencha o cartão abaixo.');
+    } catch (err) {
+      setMessage(err.message);
+    }
+  }
+
+  async function handleSaveCard() {
+    if (!clientSecret) return setMessage('Crie o SetupIntent primeiro.');
+    const { setupIntent, error } = await confirmSetupIntent(clientSecret, { paymentMethodType: 'Card' });
+    if (error) {
+      setMessage(error.message);
+      return;
+    }
+    // enviar setupIntent.id ao backend para anexar
+    const res = await fetch(`${API}/contracts/${contractId}/attach-payment-method`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${global.userToken || ''}` },
+      body: JSON.stringify({ setup_intent_id: setupIntent.id })
+    });
+    const j = await res.json();
+    if (!res.ok) setMessage(JSON.stringify(j));
+    else setMessage('Cartão salvo com sucesso!');
+  }
+
+  return (
+    <StripeProvider publishableKey={Constants.manifest.extra.publishableKey || 'pk_test_xxx'}>
+      <View style={{ padding: 20 }}>
+        <Text>Contract ID</Text>
+        <TextInput value={contractId} onChangeText={setContractId} style={{ borderWidth:1, padding:8, marginVertical:8 }} />
+        <Button title="Criar SetupIntent" onPress={createSetupIntent} />
+        <Text style={{ marginTop: 12 }}>{message}</Text>
+
+        <CardField postalCodeEnabled={true} style={{ height: 50, marginVertical: 20 }} />
+        <Button title="Salvar Cartão" onPress={handleSaveCard} />
+      </View>
+    </StripeProvider>
+  );
+}
+│     └─ PaymentSetupWebView.js
+import React, { useEffect, useState } from 'react';
+import { View, ActivityIndicator } from 'react-native';
+import { WebView } from 'react-native-webview';
+import Constants from 'expo-constants';
+
+export default function PaymentSetupWebView({ route }) {
+  // backend must expose a hosted page endpoint (e.g. /hosted/payment-setup?contract_id=xxx)
+  const API = Constants.manifest.extra.apiUrl || 'http://localhost:3000';
+  const [url, setUrl] = useState(null);
+
+  useEffect(() => {
+    // get url for hosted payment element
+    async function fetchUrl() {
+      const res = await fetch(`${API}/hosted/setup-page?contract_id=demo`);
+      const j = await res.json();
+      if (res.ok) setUrl(j.url);
+      else console.error(j);
+    }
+    fetchUrl();
+  }, []);
+
+  if (!url) return <View style={{flex:1,justifyContent:'center'}}><ActivityIndicator/></View>;
+  return <WebView source={{ uri: url }} style={{ flex: 1 }} />;
+}
+
+└─ README_DEPLOY.md
+# LocaFácil — Deploy & Run (resumo rápido)
+
+## Requisitos locais
+- Docker & docker-compose
+- Node 18+, npm
+- conta Stripe
+
+## Rodar local com Docker
+1. Copie `.env.example` para `backend/.env` e ajuste chaves (STRIPE_KEY, STRIPE_WEBHOOK_SECRET)
+2. `docker-compose up --build`
+3. Aguarde containers (postgres, redis, backend, worker)
+4. Rode migração SQL:
+   - `docker exec -it <postgres_container> psql -U locafacil -d locafacil -f /var/lib/postgresql/data/init.sql`
+   - (ou rode `psql` local com DATABASE_URL)
+5. Acesse `http://localhost:3000`
+
+## Testes Stripe (webhooks)
+- Rode `stripe listen --forward-to localhost:3000/webhooks/stripe` (stripe-cli) para encaminhar webhooks no modo dev
+- Use cartões de teste (4242 4242 4242 4242, etc.)
+
+## Deploy produção (Render / Railway)
+- Suba repo no GitHub
+- Crie serviço web (backend) apontando para `backend/`
+- Configure variáveis de ambiente (DATABASE_URL, STRIPE_KEY, STRIPE_WEBHOOK_SECRET, REDIS_URL, JWT_SECRET)
+- Crie um serviço worker (com command `node workers/billingWorker.js`) ou use processos separados
+- Configure webhook Stripe para `https://<seu-dominio>/webhooks/stripe`
+
+## Mobile (expo)
+- Use EAS Build se deseja `@stripe/stripe-react-native`:
+  - `eas build -p android` / `eas build -p ios`
+- Se não quer EAS, implemente hosted payment page e use WebView
+
